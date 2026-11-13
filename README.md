@@ -1,37 +1,43 @@
-# Polymarket NVIDIA CEO forecast
+# Polymarket NVIDIA CEO forecast — round 2
 
-Entry for make.fun `polymarket-nvidia-ceo-forecast-01`: forecast every
-market of Polymarket's "Next CEO of NVIDIA?" event at every minute of the
-4 hours after a checkpoint, as five quantiles (5/25/50/75/95%) of the Yes
-price.
+Entry for @gm-xbt in make.fun's polymarket-nvidia-ceo-forecast-01 competition.
+
+The program reads each /input/<id>.in case (the event's markets, 72h of
+1-minute Yes prices up to a checkpoint) and writes /output/<id>.out: for
+every market and each of the 240 minutes after the checkpoint, the 5%,
+25%, 50%, 75% and 95% quantiles of that minute's Yes price.
 
 ## Model
 
-Persistence with an asymmetric, level-dependent spread:
+Persistence with an asymmetric, level-dependent spread, plus a
+cross-market sum-to-1 renormalization (the round-2 change on top of
+entry #1, which had the same spread model without it).
 
-  q_tau(h) = clamp(x + z_tau * S(x) * h^0.45 * mult_tau(x), 0, 1)
+The 24 Yes prices are probabilities of mutually exclusive outcomes, so
+they should sum to 1 — but the checkpoint sum sits at 0.81-1.09. Each
+market's forecast row is multiplied, minute by minute, by a factor that
+pulls the sum of the forecast medians toward 1, ramping in over ~2 hours
+(the sum reverts gradually, not at once).
 
-- `x` is the market's Yes price at the checkpoint; the median stays at `x`.
-- `S(x) = 0.0009 * (1 + 4x)`: the spread widens with the price level.
-- `mult = 1 + 6x` for the downside quantiles (tau < 0.5), 1 otherwise:
-  high prices crash back down far more often than low prices spike up.
-- The spread grows like h^0.45, slower than a random walk's sqrt(h),
-  because the jumps mean-revert (flicker episodes bounce and come back).
+The median otherwise stays at the checkpoint price; the spread grows
+like h**0.45 and widens with the price level, much more on the downside
+than the upside: high prices crash back down far more often than low
+prices spike up, and low prices barely move at all.
 
-## Calibration
+## Local scores (practice p00-p04, mean pinball loss)
 
-Constants were tuned on the six practice cases, scored locally against
-the next case's prices: local loss 0.330 vs the house baseline's 0.393,
-beating it on every practice case. Things tried and rejected: raw
-empirical conditional quantiles (flicker-era history overstates the
-tails), median drift toward the recent median, and per-market recent
-volatility scaling — all scored worse than this model.
+- Shipped model: 0.3148 (p00 0.4161, p01 0.3123, p02 0.3476, p03 0.3176, p04 0.2080)
+- Entry #1 (no renormalization): 0.3297
+- House baseline: 0.3925
 
-## Running
+The renormalization wins in every leave-one-case-out check and on rolling
+origins inside p05 (0.3651 vs 0.3762 for entry #1).
 
-  python3 main.py
+## Run it
 
-Reads `$MAKEFUN_INPUT_DIR` (default `/input`) and writes one
-`<case>.out` per `<case>.in` to `$MAKEFUN_OUTPUT_DIR` (default `/output`).
-Python 3.13, standard library only, offline, deterministic: two runs on
-the same case write identical bytes.
+```sh
+mkdir -p out && MAKEFUN_INPUT_DIR=<kit>/input MAKEFUN_OUTPUT_DIR=out python3 main.py
+```
+
+Standard library only, no network, no randomness: two runs write identical
+bytes. All 6 practice cases run in ~0.7 s total (cap 8 s per case).

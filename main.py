@@ -5,13 +5,14 @@ prices up to a checkpoint) and writes /output/<id>.out: for every market
 and each of the 240 minutes after the checkpoint, the 5%, 25%, 50%, 75%
 and 95% quantiles of that minute's Yes price.
 
-Model: persistence with an asymmetric, level-dependent spread. The median
-stays at the checkpoint price; the spread grows like h**0.45 and widens
-with the price level, much more on the downside than the upside: high
-prices crash back down far more often than low prices spike up, and low
-prices barely move at all. Constants were calibrated on the six practice
-cases, scored locally against the next case's prices (see BUILD_LOG.md
-in the work directory, not part of this entry).
+Model: persistence with an asymmetric, level-dependent spread, plus a
+cross-market sum-to-1 renormalization. The 24 Yes prices are probabilities
+of mutually exclusive outcomes, so they should sum to 1; the checkpoint
+sum instead sits at 0.81-1.09. Each market's forecast row is multiplied,
+minute by minute, by a factor that pulls the sum of the forecast medians
+toward 1, ramping in over ~2 hours (the sum reverts gradually, not at
+once). The spread grows like h**0.45, wider for higher prices and on
+the downside.
 """
 import json
 import math
@@ -28,6 +29,10 @@ ALPHA = 0.45
 KX = 4.0
 # Downside (tau < 0.5) spread grows faster with the level: 1 + KD * x.
 KD = 6.0
+# Sum-to-1 renormalization: full strength W, ramping in with time
+# constant TAU minutes (factor 1 - exp(-h/TAU)).
+RENORM_W = 1.0
+RENORM_TAU = 120.0
 
 
 def _norm_ppf(p):
@@ -38,8 +43,7 @@ def _norm_ppf(p):
          -2.759285984469534e02, 1.383577518672690e02,
          -3.066479806614716e01, 2.506628277459239e00)
     b = (-5.447609879822406e01, 1.615858368580409e02,
-         -1.556989798598866e02, 6.680131188771972e01,
-         -1.328068155288572e01)
+         -1.556989798598866e02, 6.680131188771972e01, -1.328068155288572e01)
     c = (-7.784894002430293e-03, -3.223964580411365e-01,
          -2.400758277161838e00, -2.549732539343734e00,
          4.374664141464968e00, 2.938163982698783e00)
@@ -67,7 +71,6 @@ def _norm_ppf(p):
            + 1.0)
     return num / den
 
-
 def _price6(x):
     """Clamp to [0, 1] and round to 6 decimals (0, never -0)."""
     return round(min(1.0, max(0.0, x)) * 1e6) / 1e6 + 0.0
@@ -91,6 +94,13 @@ def forecast_market(x, horizon, zetas):
     return rows
 
 
+def _renorm_factor(h, sum0):
+    """Pull factor for minute h: moves the forecast-median sum toward 1."""
+    if sum0 <= 0.0:
+        return 1.0
+    w = RENORM_W * (1.0 - math.exp(-h / RENORM_TAU))
+    return 1.0 + w * (1.0 / sum0 - 1.0)
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     names = sorted(n for n in os.listdir(INPUT_DIR) if n.endswith(".in"))
@@ -100,14 +110,24 @@ def main():
                   encoding="utf-8") as f:
             case = json.load(f)
         zetas = [_norm_ppf(t) for t in case["quantiles"]]
+        markets = case["markets"]
+        sum0 = sum(m["prices"][-1] for m in markets if m["prices"])
         forecasts = []
-        for market in case["markets"]:
+        for market in markets:
             prices = market["prices"]
             if not prices:
                 raise ValueError("market %s has no prices" % market["id"])
             rows = forecast_market(prices[-1], case["horizon_minutes"],
                                   zetas)
-            forecasts.append({"id": market["id"], "q": rows})
+            adj = []
+            for hi, row in enumerate(rows):
+                f = _renorm_factor(hi + 1, sum0)
+                nr = [_price6(q * f) for q in row]
+                for j in range(1, len(nr)):
+                    if nr[j] < nr[j - 1]:
+                        nr[j] = nr[j - 1]
+                adj.append(nr)
+            forecasts.append({"id": market["id"], "q": adj})
         out = os.path.join(OUTPUT_DIR, case_id + ".out")
         with open(out, "w", encoding="utf-8") as f:
             f.write(json.dumps({"forecasts": forecasts}) + "\n")
