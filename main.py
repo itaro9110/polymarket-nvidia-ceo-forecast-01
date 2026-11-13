@@ -6,13 +6,12 @@ and each of the 240 minutes after the checkpoint, the 5%, 25%, 50%, 75%
 and 95% quantiles of that minute's Yes price.
 
 Model: persistence with an asymmetric, level-dependent spread, plus a
-cross-market sum-to-1 renormalization. The 24 Yes prices are probabilities
-of mutually exclusive outcomes, so they should sum to 1; the checkpoint
-sum instead sits at 0.81-1.09. Each market's forecast row is multiplied,
-minute by minute, by a factor that pulls the sum of the forecast medians
-toward 1, ramping in over ~2 hours (the sum reverts gradually, not at
-once). The spread grows like h**0.45, wider for higher prices and on
-the downside.
+cross-market sum-to-1 renormalization, jump-aware spread widening, and
+tighter inner quantiles. Prices sit flat most minutes then flicker-jump;
+a market that jumped recently is more volatile ahead, so its spread
+widens right after a jump (decaying over ~2h) and with its jump count
+over the last 4h. The inner (25%/75%) quantiles are narrower and grow
+more slowly with horizon than the outer (5%/95%) tails.
 """
 import json
 import math
@@ -25,6 +24,8 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 SIGMA0 = 0.0009
 # Spread grows like h ** ALPHA (slower than sqrt(h): jumps mean-revert).
 ALPHA = 0.45
+# Inner quantiles grow more slowly with horizon than the outer tails.
+ALPHA_INNER = 0.40
 # Spread scale grows with the price level: 1 + KX * x.
 KX = 4.0
 # Downside (tau < 0.5) spread grows faster with the level: 1 + KD * x.
@@ -33,6 +34,17 @@ KD = 6.0
 # constant TAU minutes (factor 1 - exp(-h/TAU)).
 RENORM_W = 1.0
 RENORM_TAU = 120.0
+# Tail calibration: outer quantiles wider, inner quantiles narrower.
+TAIL_OUTER = 1.1
+TAIL_INNER = 0.85
+# Jump boost: if a |d1| > 0.05 jump happened in the last JUMP_AGE
+# minutes, widen the spread by 1 + JUMP_C * exp(-h/JUMP_TAU).
+JUMP_C = 1.0
+JUMP_TAU = 120.0
+JUMP_AGE = 60
+# Jump-count boost: 1 + NJUMP_C * min(njump240, NJUMP_CAP) / NJUMP_CAP.
+NJUMP_C = 0.5
+NJUMP_CAP = 3
 
 
 def _norm_ppf(p):
@@ -71,22 +83,53 @@ def _norm_ppf(p):
            + 1.0)
     return num / den
 
+
 def _price6(x):
     """Clamp to [0, 1] and round to 6 decimals (0, never -0)."""
     return round(min(1.0, max(0.0, x)) * 1e6) / 1e6 + 0.0
 
 
-def forecast_market(x, horizon, zetas):
+def _jump_factors(p):
+    """Jump-aware spread factors from a market's price history.
+
+    Returns (boost, jb): boost is a per-minute multiplier list that
+    widens the spread right after a recent jump and decays over ~2h
+    (None when no jump in the last JUMP_AGE minutes); jb is a static
+    multiplier from the jump count over the last 240 minutes.
+    """
+    d = [p[k + 1] - p[k] for k in range(len(p) - 1)]
+    nj = sum(1 for v in d[-240:] if abs(v) > 0.05)
+    jb = 1.0 + NJUMP_C * min(nj, NJUMP_CAP) / float(NJUMP_CAP)
+    age = 999
+    for k in range(len(d) - 1, -1, -1):
+        if abs(d[k]) > 0.05:
+            age = len(d) - 1 - k
+            break
+    if age < JUMP_AGE:
+        boost = [1.0 + JUMP_C * math.exp(-h / JUMP_TAU)
+                 for h in range(1, 241)]
+    else:
+        boost = None
+    return boost, jb
+
+
+def forecast_market(x, horizon, zetas, boost, jb):
     """All horizon rows of quantiles for one market at checkpoint price x."""
     scale = SIGMA0 * (1.0 + KX * x)
     down = 1.0 + KD * x
+    mult = (down * TAIL_OUTER, down * TAIL_INNER, 1.0,
+            TAIL_INNER, TAIL_OUTER)
+    alphas = (ALPHA, ALPHA_INNER, ALPHA, ALPHA_INNER, ALPHA)
     rows = []
     for h in range(1, horizon + 1):
-        base = scale * (h ** ALPHA)
         row = []
-        for z in zetas:
-            mult = down if z < 0.0 else 1.0
-            row.append(_price6(x + z * base * mult))
+        for j, z in enumerate(zetas):
+            v = x + z * mult[j] * scale * jb * (h ** alphas[j])
+            row.append(v)
+        if boost is not None:
+            b = boost[h - 1]
+            row = [x + (v - x) * b for v in row]
+        row = [_price6(v) for v in row]
         for j in range(1, len(row)):
             if row[j] < row[j - 1]:
                 row[j] = row[j - 1]
@@ -100,6 +143,7 @@ def _renorm_factor(h, sum0):
         return 1.0
     w = RENORM_W * (1.0 - math.exp(-h / RENORM_TAU))
     return 1.0 + w * (1.0 / sum0 - 1.0)
+
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -117,8 +161,9 @@ def main():
             prices = market["prices"]
             if not prices:
                 raise ValueError("market %s has no prices" % market["id"])
+            boost, jb = _jump_factors(prices)
             rows = forecast_market(prices[-1], case["horizon_minutes"],
-                                  zetas)
+                                  zetas, boost, jb)
             adj = []
             for hi, row in enumerate(rows):
                 f = _renorm_factor(hi + 1, sum0)

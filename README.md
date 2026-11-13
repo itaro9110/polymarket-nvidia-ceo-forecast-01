@@ -1,43 +1,43 @@
-# Polymarket NVIDIA CEO forecast — round 2
+# Polymarket 'Next CEO of NVIDIA?' forecast — round 3
 
-Entry for @gm-xbt in make.fun's polymarket-nvidia-ceo-forecast-01 competition.
-
-The program reads each /input/<id>.in case (the event's markets, 72h of
-1-minute Yes prices up to a checkpoint) and writes /output/<id>.out: for
-every market and each of the 240 minutes after the checkpoint, the 5%,
-25%, 50%, 75% and 95% quantiles of that minute's Yes price.
+Forecasts each market's Yes price at every minute of the 4 hours after
+a checkpoint: the 5%, 25%, 50%, 75% and 95% quantiles. Pure Python 3.13
+stdlib, offline, deterministic.
 
 ## Model
 
-Persistence with an asymmetric, level-dependent spread, plus a
-cross-market sum-to-1 renormalization (the round-2 change on top of
-entry #1, which had the same spread model without it).
+Persistence with an asymmetric, level-dependent spread, plus three
+round-3 refinements on top of the round-2 entry:
 
-The 24 Yes prices are probabilities of mutually exclusive outcomes, so
-they should sum to 1 — but the checkpoint sum sits at 0.81-1.09. Each
-market's forecast row is multiplied, minute by minute, by a factor that
-pulls the sum of the forecast medians toward 1, ramping in over ~2 hours
-(the sum reverts gradually, not at once).
+- **Sum-to-1 renormalization.** The 24 Yes prices are probabilities of
+  mutually exclusive outcomes, so they should sum to 1; the checkpoint
+  sum sits at 0.81-1.09. Each forecast row is multiplied by a factor
+  pulling the median sum toward 1, ramping in over ~2 hours.
+- **Jump-aware spreads.** Prices sit flat most minutes then flicker-
+  jump. A market that jumped (|1-min change| > 0.05) in the last hour
+  gets its spread widened by up to 2x, decaying over ~2 hours; a
+  further widening comes from its jump count over the last 4 hours.
+- **Tighter inner quantiles.** The 25%/75% quantiles are 15% narrower
+  and grow more slowly with horizon (h^0.40 vs h^0.45) than the outer
+  5%/95% tails, which are 10% wider.
 
-The median otherwise stays at the checkpoint price; the spread grows
-like h**0.45 and widens with the price level, much more on the downside
-than the upside: high prices crash back down far more often than low
-prices spike up, and low prices barely move at all.
+The median stays at the checkpoint price; the spread grows like
+h^0.45, wider for higher prices and on the downside (high prices crash
+back down far more often than low prices spike up).
 
-## Local scores (practice p00-p04, mean pinball loss)
+## Local practice (p00-p04, scored against the next case's prices)
 
-- Shipped model: 0.3148 (p00 0.4161, p01 0.3123, p02 0.3476, p03 0.3176, p04 0.2080)
-- Entry #1 (no renormalization): 0.3297
-- House baseline: 0.3925
+| model | mean pinball loss |
+|---|---|
+| house baseline | 0.392518 |
+| entry #1 (persistence + spread) | 0.329740 |
+| entry #2 (+ sum-to-1 renorm) | 0.314827 |
+| **this entry (round 3)** | **0.304798** |
 
-The renormalization wins in every leave-one-case-out check and on rolling
-origins inside p05 (0.3651 vs 0.3762 for entry #1).
-
-## Run it
-
-```sh
-mkdir -p out && MAKEFUN_INPUT_DIR=<kit>/input MAKEFUN_OUTPUT_DIR=out python3 main.py
-```
-
-Standard library only, no network, no randomness: two runs write identical
-bytes. All 6 practice cases run in ~0.7 s total (cap 8 s per case).
+Beats entry #2 on every practice case (p00 0.3942, p01 0.3057,
+p02 0.3463, p03 0.3065, p04 0.1988); leave-one-case-out wins 5/5;
+rolling origins inside p05 win on all 6 windows (0.3502 vs 0.3651);
+the frozen-price stress test is also better than entry #2 (0.0813 vs
+0.0980). What did NOT work: cross-market spillover drift (the renorm
+already captures the level coupling — extra drift double-counts),
+spike-based downside widening, and per-market activity scaling.
